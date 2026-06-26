@@ -119,7 +119,7 @@ public class StreamingMilsoftStdParser {
     }
 
     public void stream(InputStream in, String fileName,
-                       Consumer<CIMObject> onObject) throws Exception {
+                       Consumer<ParsedRow> onObject) throws Exception {
         long total = 0, skipped = 0;
 
         try (BufferedReader reader = new BufferedReader(
@@ -138,9 +138,9 @@ public class StreamingMilsoftStdParser {
                 }
 
                 try {
-                    CIMObject obj = parseRow(line, fileName, lineNum);
-                    if (obj != null) {
-                        onObject.accept(obj);
+                    ParsedRow pr = parseRow(line, fileName, lineNum);
+                    if (pr != null) {
+                        onObject.accept(pr);
                         total++;
                     } else {
                         skipped++;
@@ -155,9 +155,37 @@ public class StreamingMilsoftStdParser {
                 total, skipped, fileName);
     }
 
-    private CIMObject parseRow(String line, String fileName, int lineNum) {
+    /**
+     * Parse one data row into a {@link ParsedRow} carrying two views:
+     * <ul>
+     *   <li>{@code raw} — Milsoft-shaped, destined for {@code raw_objects}.
+     *       cimType = the section code as a string ("9", "4", "10", ...).
+     *       Attributes: only {@code Milsoft.col_<n>} positional dumps,
+     *       {@code Milsoft.sectionType}, {@code Milsoft.phaseCode},
+     *       {@code Milsoft.parentId}.  No CIM-class attribute paths.</li>
+     *   <li>{@code cim} — CIM-translated view, destined for {@code cim_objects}
+     *       via namespace filtering.  cimType = real CIM class
+     *       ({@code EnergySource}, {@code ACLineSegment}, etc.).  Attributes:
+     *       CIM-named paths only ({@code IdentifiedObject.name},
+     *       {@code ACDCTerminal.phases}, {@code PositionPoint.xPosition},
+     *       {@code PositionPoint.lon}, etc.) plus refinement tags
+     *       ({@code Milsoft.lineType}, {@code Milsoft.sectionType}) that
+     *       downstream consumers like the GeoJSON service use to refine the
+     *       label.</li>
+     * </ul>
+     * Both views share the same {@code rdfId} so they can be correlated.
+     *
+     * <p>The {@code Milsoft.parent} reference is kept on BOTH sides because:
+     * <ul>
+     *   <li>raw needs it for re-validation (revalidate rebuilds cim_objects
+     *       from raw_objects, including topology resolution).</li>
+     *   <li>cim needs it so the reference resolver and Neo4j export wire
+     *       the topology graph correctly.</li>
+     * </ul>
+     */
+    private ParsedRow parseRow(String line, String fileName, int lineNum) {
         String[] f = splitCsv(line);
-        if (f.length < 4) return null;   // need the 4 mandatory fields
+        if (f.length < 4) return null;
 
         String id        = trim(f[0]);
         String typeRaw   = trim(f[1]);
@@ -167,104 +195,116 @@ public class StreamingMilsoftStdParser {
         if (id.isEmpty()) return null;
 
         Integer typeCode = parseIntOrNull(typeRaw);
-        if (typeCode == null) return null;            // non-numeric type → skip
-        if (typeCode == 0 || typeCode == 7) return null;  // markers / undefined
+        if (typeCode == null) return null;
+        if (typeCode == 0 || typeCode == 7) return null;
 
+        boolean hasParent = !parentRaw.isEmpty()
+                && !"ROOT".equalsIgnoreCase(parentRaw)
+                && !"0".equals(parentRaw);
+
+        // ── Build the RAW view ─────────────────────────────────────────────
+        // No CIM class assignment, no CIM attribute paths.  cimType is the
+        // section code as a string so nothing here pretends to be CIM.  This
+        // is what goes into raw_objects — full audit fidelity to the file.
+        CIMObject raw = new CIMObject(typeRaw, id);
+        raw.setSourceFile(fileName);
+        raw.setSourceFormat("MILSOFT_STD");
+
+        if (hasParent) {
+            raw.addReference(PFX + "parent", parentRaw);
+            raw.setAttribute(PFX + "parentId", parentRaw);
+        }
+        raw.setAttribute(PFX + "sectionType", typeRaw);
+        if (!phaseRaw.isEmpty()) raw.setAttribute(PFX + "phaseCode", phaseRaw);
+
+        // Map number — vendor-internal grouping, stays on raw only.
+        if (f.length > 4 && !trim(f[4]).isEmpty()) {
+            raw.setAttribute(PFX + "mapNumber", trim(f[4]));
+        }
+
+        // Every column verbatim → Milsoft.col_<i>, raw side only.  Preserves
+        // the original row layout for the audit collection.
+        for (int i = 0; i < f.length; i++) {
+            String v = trim(f[i]);
+            if (!v.isEmpty()) raw.setAttribute(PFX + "col_" + i, v);
+        }
+
+        // ── Build the CIM view ─────────────────────────────────────────────
+        // CIM class assigned from the type code; attribute names follow CIM
+        // conventions only.  No Milsoft.col_<n> clutter — the CIM collection
+        // reads as CIM data, not as a Milsoft dump.
         String cimType = TYPE_TO_CIM.get(typeCode);
         if (cimType == null) {
-            // Unknown but numeric type — keep it, namespaced, rather than drop.
+            // Unknown but numeric type — keep it under a vendor-prefixed
+            // pseudo-class so the row still surfaces in cim_objects and
+            // operators can grep for "MilsoftType<n>" to find rows needing
+            // a mapping entry.
             cimType = "MilsoftType" + typeCode;
         }
 
-        // rdfId = raw Milsoft identifier (verbatim) so parent refs resolve.
-        CIMObject o = new CIMObject(cimType, id);
-        o.setSourceFile(fileName);
-        o.setSourceFormat("MILSOFT_CSV");
+        CIMObject cim = new CIMObject(cimType, id);
+        cim.setSourceFile(fileName);
+        cim.setSourceFormat("MILSOFT_STD");
 
-        // Name: prefer the Preferred Section Name (col 7) when present,
-        // otherwise fall back to the identifier itself.
+        // Identity — name (col 7 Preferred Section Name, else identifier).
         String preferred = f.length > 7 ? trim(f[7]) : "";
-        o.setAttribute("IdentifiedObject.name",
+        cim.setAttribute("IdentifiedObject.name",
                 preferred.isEmpty() ? id : preferred);
 
-        // Phases.
+        // Phases via CIM PhaseCode literals (ABC, A, BC, etc.).
         Integer phaseCode = parseIntOrNull(phaseRaw);
         if (phaseCode != null && PHASE_MAP.containsKey(phaseCode)) {
-            o.setAttribute("ACDCTerminal.phases", PHASE_MAP.get(phaseCode));
-        }
-        if (!phaseRaw.isEmpty()) o.setAttribute(PFX + "phaseCode", phaseRaw);
-
-        // Parent topology link → reference (resolves against parent rdfId).
-        if (!parentRaw.isEmpty()
-                && !"ROOT".equalsIgnoreCase(parentRaw)
-                && !"0".equals(parentRaw)) {
-            o.addReference(PFX + "parent", parentRaw);
-            o.setAttribute(PFX + "parentId", parentRaw);
+            cim.setAttribute("ACDCTerminal.phases", PHASE_MAP.get(phaseCode));
         }
 
-        // Map number (col 4).
-        if (f.length > 4 && !trim(f[4]).isEmpty()) {
-            o.setAttribute(PFX + "mapNumber", trim(f[4]));
+        // Section type — kept on CIM too for refinement tooling.  The GeoJSON
+        // service uses this (combined with Milsoft.lineType from decorateByType
+        // for code 1/3) to split ACLineSegment into OverheadLine vs
+        // UndergroundLine.  Treated as a CIM-side refinement annotation, not
+        // mainline CIM data.
+        cim.setAttribute(PFX + "sectionType", typeRaw);
+
+        // Parent topology link — kept on CIM so the reference resolver and
+        // topology synthesis pass can wire connectivity.
+        if (hasParent) {
+            cim.addReference(PFX + "parent", parentRaw);
         }
 
-        // Coordinates (col 5 X, col 6 Y) — store both raw state-plane values
-        // and pre-converted WGS84 lon/lat.
-        //
-        // Why both:
-        //   • Raw state-plane (xPosition/yPosition) is the source data and
-        //     must be preserved for audit / re-projection with different
-        //     parameters / external tools that consume state-plane natively.
-        //   • Pre-converted lon/lat (PositionPoint.lon, PositionPoint.lat)
-        //     lets the GeoJSON service and any downstream consumer use
-        //     lat/long without repeating the projection per consumer.
-        //
-        // The projector is NC State Plane only — see com.cim.util.NcState-
-        // PlaneProjector class doc for the caveat about non-NC data.  Wake
-        // is in NC so this is correct here.
-        //
-        // On per-row conversion failure (rare — only for truly garbage
-        // input that can't even be parsed as a double, or coordinates that
-        // fall outside the projection's convergent area), we still store
-        // the raw values for audit but write sentinel zero lon/lat AND a
-        // Milsoft.coordError attribute so the GeoJSON writer can skip the
-        // row.
+        // Coordinates — see comment block in old single-emission version.
+        // The CIM view carries BOTH the raw state-plane and the converted
+        // WGS84 lon/lat.  Raw state-plane stays on the CIM side because
+        // PositionPoint.xPosition/yPosition are CIM property paths; only
+        // the Milsoft.col_<n> fallback (raw-only) duplicates them positionally.
+        // Conversion errors are flagged ON THE CIM SIDE via Milsoft.coordError
+        // — that's where the GeoJSON service looks.
         boolean hasX = f.length > 5 && !trim(f[5]).isEmpty();
         boolean hasY = f.length > 6 && !trim(f[6]).isEmpty();
-        if (hasX) o.setAttribute("PositionPoint.xPosition", trim(f[5]));
-        if (hasY) o.setAttribute("PositionPoint.yPosition", trim(f[6]));
+        if (hasX) cim.setAttribute("PositionPoint.xPosition", trim(f[5]));
+        if (hasY) cim.setAttribute("PositionPoint.yPosition", trim(f[6]));
         if (hasX && hasY) {
             try {
                 double xFt = Double.parseDouble(trim(f[5]));
                 double yFt = Double.parseDouble(trim(f[6]));
                 String[] lonLat =
                         com.cim.util.NcStatePlaneProjector.toWgs84Strings(xFt, yFt);
-                o.setAttribute("PositionPoint.lon", lonLat[0]);
-                o.setAttribute("PositionPoint.lat", lonLat[1]);
+                cim.setAttribute("PositionPoint.lon", lonLat[0]);
+                cim.setAttribute("PositionPoint.lat", lonLat[1]);
             } catch (Exception ex) {
-                // Sentinel zeros + error flag.  Downstream GeoJSON service
-                // checks Milsoft.coordError and skips rather than placing
-                // features at (0,0) off the African coast.
-                o.setAttribute("PositionPoint.lon", "0");
-                o.setAttribute("PositionPoint.lat", "0");
-                o.setAttribute(PFX + "coordError", ex.getMessage() == null
+                // Sentinel zeros + error flag.  GeoJSON service checks
+                // Milsoft.coordError and skips so features don't land at (0,0).
+                cim.setAttribute("PositionPoint.lon", "0");
+                cim.setAttribute("PositionPoint.lat", "0");
+                cim.setAttribute(PFX + "coordError", ex.getMessage() == null
                         ? "conversion-failed" : ex.getMessage());
             }
         }
 
-        // Type code itself, for traceability/filtering.
-        o.setAttribute(PFX + "sectionType", typeRaw);
+        // Type-specific decoration — adds named CIM attributes for fields
+        // whose CIM meaning is unambiguous.  Operates on the CIM side only;
+        // raw has the data positionally via Milsoft.col_<n>.
+        decorateByType(cim, typeCode, f);
 
-        // Type-specific named fields where the spec is unambiguous.
-        decorateByType(o, typeCode, f);
-
-        // Preserve EVERY non-empty column verbatim for the raw_objects audit
-        // trail.  Keyed by position so the original layout is recoverable.
-        for (int i = 0; i < f.length; i++) {
-            String v = trim(f[i]);
-            if (!v.isEmpty()) o.setAttribute(PFX + "col_" + i, v);
-        }
-
-        return o;
+        return new ParsedRow(raw, cim);
     }
 
     /**
