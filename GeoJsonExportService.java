@@ -4,6 +4,7 @@ import com.cim.model.mongo.CimObjectRecord;
 import com.cim.repository.CimObjectRecordRepository;
 import com.cim.repository.ValidationJobRepository;
 import com.cim.util.MapKeySanitizer;
+import com.cim.util.NcStatePlaneProjector;
 import com.fasterxml.jackson.core.JsonEncoding;
 import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonGenerator;
@@ -66,10 +67,25 @@ import java.util.Map;
  * The Lambert Conformal Conic constants are hardcoded for NC State Plane
  * (NAD83).  Files imported from other states will produce <em>wrong</em>
  * lat/long output — the X/Y numbers come through the inverse projection
- * with the wrong assumptions and land far from the source location.  A
- * startup sanity check ({@link #verifyProjection()}) converts a known
- * Wake-County point and logs a warning if the result is off — but it
- * doesn't fail the service.
+ * with the wrong assumptions and land far from the source location.  At
+ * construction time we run a sanity check against a known Wake-County
+ * reference point via {@link NcStatePlaneProjector#verifyKnownPoint}; a
+ * warning is logged if the math has drifted, but the service stays
+ * usable either way.
+ *
+ * <h2>Coordinate sources (preferred → fallback)</h2>
+ * Each row's lon/lat comes from the first source available:
+ * <ol>
+ *   <li>Pre-converted {@code PositionPoint.lon} / {@code PositionPoint.lat}
+ *       written by the Milsoft parsers during import — cheapest, no
+ *       projection call at export time.</li>
+ *   <li>On-the-fly conversion of {@code PositionPoint.xPosition} /
+ *       {@code yPosition} via {@link NcStatePlaneProjector#toWgs84} —
+ *       backward-compatible for old imports.</li>
+ * </ol>
+ * Rows flagged by the parser with {@code Milsoft.coordError} are skipped
+ * (their stored lon/lat are sentinel zeros and would otherwise land on
+ * the equator off the West African coast).
  *
  * <h2>Streaming output</h2>
  * Features are written using a Jackson streaming generator so a 116k-row
@@ -120,6 +136,18 @@ public class GeoJsonExportService {
     private static final String KEY_NAME    = MapKeySanitizer.encode("IdentifiedObject.name");
     private static final String KEY_X       = MapKeySanitizer.encode("PositionPoint.xPosition");
     private static final String KEY_Y       = MapKeySanitizer.encode("PositionPoint.yPosition");
+    // Pre-converted WGS84 values written by the Milsoft parsers during
+    // import.  When present we use them directly (no per-row projection at
+    // export time).  When absent (data imported before the parser change,
+    // or non-Milsoft format) we fall back to on-the-fly conversion of
+    // xPosition/yPosition — keeping this service backward-compatible.
+    private static final String KEY_LON     = MapKeySanitizer.encode("PositionPoint.lon");
+    private static final String KEY_LAT     = MapKeySanitizer.encode("PositionPoint.lat");
+    // Set by the parser when state-plane → WGS84 conversion fails for a
+    // row.  When present, the stored lon/lat are sentinel zeros and the
+    // GeoJSON writer skips the row.
+    private static final String KEY_COORD_ERROR =
+            MapKeySanitizer.encode("Milsoft.coordError");
     private static final String KEY_PHASE   = MapKeySanitizer.encode("Milsoft.phaseCode");
     private static final String KEY_PARENT  = MapKeySanitizer.encode("Milsoft.parent");
     private static final String KEY_PARENT2 = MapKeySanitizer.encode("Milsoft.parentId");
@@ -133,14 +161,21 @@ public class GeoJsonExportService {
 
     private final CimObjectRecordRepository repo;
     private final ValidationJobRepository    jobRepo;
-    private final NcStatePlaneProjector      projector;
 
     public GeoJsonExportService(CimObjectRecordRepository repo,
                                  ValidationJobRepository jobRepo) {
-        this.repo      = repo;
-        this.jobRepo   = jobRepo;
-        this.projector = new NcStatePlaneProjector();
-        verifyProjection();   // logs a warning if the math is off
+        this.repo    = repo;
+        this.jobRepo = jobRepo;
+        // Confirm the shared projector still produces correct results — same
+        // verification we used to do in-instance, now against the static
+        // utility class.  WARN-only; service stays usable either way.
+        if (!NcStatePlaneProjector.verifyKnownPoint(0.001)) {
+            log.warn("NcStatePlaneProjector sanity check FAILED — converted "
+                   + "lat/lon will be wrong for NC data.  Investigate the "
+                   + "constants in com.cim.util.NcStatePlaneProjector.");
+        } else {
+            log.info("NcStatePlaneProjector sanity check OK");
+        }
     }
 
     /**
@@ -191,33 +226,62 @@ public class GeoJsonExportService {
                     Map<String,String> attrs = rec.getAttributes();
                     if (attrs == null) attrs = Collections.emptyMap();
 
-                    String xRaw = attrs.get(KEY_X);
-                    String yRaw = attrs.get(KEY_Y);
-                    if (isBlank(xRaw) || isBlank(yRaw)) {
-                        skippedNoCoords++;
-                        continue;
-                    }
-
-                    double xFeet, yFeet;
-                    try {
-                        xFeet = Double.parseDouble(xRaw.trim());
-                        yFeet = Double.parseDouble(yRaw.trim());
-                    } catch (NumberFormatException nfe) {
+                    // Skip rows flagged with a conversion error by the
+                    // parser — their lon/lat are sentinel zeros and emitting
+                    // them would place features at (0, 0) off the African
+                    // coast.  Counted as bad rather than missing.
+                    if (!isBlank(attrs.get(KEY_COORD_ERROR))) {
                         skippedBadCoords++;
                         continue;
                     }
 
-                    // Project to WGS84.  Inverse can fail near the standard
-                    // parallels mathematically (rare) or for nonsense input.
-                    double[] lonLat;
-                    try {
-                        lonLat = projector.toWgs84(xFeet, yFeet);
-                    } catch (Exception ex) {
-                        skippedBadCoords++;
-                        continue;
+                    // Preferred path: read pre-converted WGS84 lon/lat the
+                    // Milsoft parser wrote during import.  Cheap (no projection
+                    // call at export time) and consistent (no chance of an
+                    // export-time projection drift relative to what the
+                    // parser produced).
+                    double lon, lat;
+                    String lonStr = attrs.get(KEY_LON);
+                    String latStr = attrs.get(KEY_LAT);
+                    if (!isBlank(lonStr) && !isBlank(latStr)) {
+                        try {
+                            lon = Double.parseDouble(lonStr.trim());
+                            lat = Double.parseDouble(latStr.trim());
+                        } catch (NumberFormatException nfe) {
+                            skippedBadCoords++;
+                            continue;
+                        }
+                    } else {
+                        // Fallback path: no pre-converted values present.
+                        // Convert from raw state-plane on the fly so old data
+                        // (imported before the parser change) still works,
+                        // and so non-Milsoft imports that happen to have
+                        // state-plane coordinates can still produce GeoJSON.
+                        String xRaw = attrs.get(KEY_X);
+                        String yRaw = attrs.get(KEY_Y);
+                        if (isBlank(xRaw) || isBlank(yRaw)) {
+                            skippedNoCoords++;
+                            continue;
+                        }
+                        double xFeet, yFeet;
+                        try {
+                            xFeet = Double.parseDouble(xRaw.trim());
+                            yFeet = Double.parseDouble(yRaw.trim());
+                        } catch (NumberFormatException nfe) {
+                            skippedBadCoords++;
+                            continue;
+                        }
+                        try {
+                            double[] lonLat = NcStatePlaneProjector.toWgs84(xFeet, yFeet);
+                            lon = lonLat[0];
+                            lat = lonLat[1];
+                        } catch (Exception ex) {
+                            skippedBadCoords++;
+                            continue;
+                        }
                     }
 
-                    writeFeature(g, rec, attrs, lonLat[0], lonLat[1]);
+                    writeFeature(g, rec, attrs, lon, lat);
                     featuresWritten++;
                 }
                 if (!slice.hasNext()) break;
@@ -376,157 +440,6 @@ public class GeoJsonExportService {
 
     private static boolean isBlank(String s) {
         return s == null || s.trim().isEmpty();
-    }
-
-    /**
-     * Sanity-check the hardcoded NC State Plane constants against a known
-     * Wake-County point.  The {@code BU} EnergySource at state-plane
-     * {@code (2071886.23919, 853078.1418)} should land near WGS84
-     * {@code (-78.7566937829, 36.0936509423)} — the value visible in the
-     * legacy GeoJSON sample.
-     *
-     * <p>If the converted coordinates are more than ~0.001° (≈ 100 m) off,
-     * the math is wrong (likely a constant transcription error or a
-     * misunderstanding of the foot type).  We log a WARN rather than
-     * throw, because the service is still useful for non-Wake data even
-     * if the verification fails — but operators should investigate.
-     */
-    private void verifyProjection() {
-        try {
-            double[] r = projector.toWgs84(2071886.23919, 853078.1418);
-            double dLon = Math.abs(r[0] - (-78.7566937829));
-            double dLat = Math.abs(r[1] -   36.0936509423);
-            if (dLon > 0.001 || dLat > 0.001) {
-                log.warn("NC State Plane projection sanity check FAILED: "
-                        + "expected ~(-78.7567, 36.0937), got ({}, {}). "
-                        + "GeoJSON coordinates will be wrong.  Review the "
-                        + "constants in NcStatePlaneProjector.",
-                        r[0], r[1]);
-            } else {
-                log.info("NC State Plane projection sanity check OK "
-                       + "(BU node converts to ({}, {}))", r[0], r[1]);
-            }
-        } catch (Exception e) {
-            log.warn("NC State Plane projection sanity check threw: {}",
-                    e.getMessage());
-        }
-    }
-
-    /**
-     * Lambert Conformal Conic (LCC) inverse — North Carolina State Plane,
-     * NAD83, US Survey Feet (EPSG:2264).
-     *
-     * <p>Constants per NCDOT / EPSG:
-     * <ul>
-     *   <li>Standard parallels: φ1 = 34°20′ N, φ2 = 36°10′ N</li>
-     *   <li>Latitude of origin: φ0 = 33°45′ N</li>
-     *   <li>Longitude of origin: λ0 = 79°00′ W</li>
-     *   <li>False easting:  609 601.22 m (= 2 000 000 US survey feet)</li>
-     *   <li>False northing: 0 m</li>
-     *   <li>Ellipsoid: GRS80 (NAD83) — a = 6 378 137 m, e² = 0.00669438002290</li>
-     * </ul>
-     *
-     * <p>Math reference: Snyder, "Map Projections — A Working Manual"
-     * (USGS Professional Paper 1395), §15 "Lambert Conformal Conic
-     * Projection".  Inverse formulas eqs. (15-4) through (15-11).
-     *
-     * <p>NAD83 → WGS84 datum shift is ignored (~1 m in this region — fine
-     * for utility-scale visualisation, not for sub-metre GPS work).
-     */
-    static final class NcStatePlaneProjector {
-
-        // GRS80 / NAD83 ellipsoid.
-        private static final double A   = 6378137.0;                  // semi-major (m)
-        private static final double E2  = 0.00669438002290;           // eccentricity squared
-        private static final double E   = Math.sqrt(E2);
-
-        // NC State Plane standard parallels and origin.
-        private static final double PHI_1 = Math.toRadians(34 + 20.0/60.0); // 34°20′
-        private static final double PHI_2 = Math.toRadians(36 + 10.0/60.0); // 36°10′
-        private static final double PHI_0 = Math.toRadians(33 + 45.0/60.0); // 33°45′
-        private static final double LAM_0 = Math.toRadians(-79.0);          // 79°W
-
-        // False origin (metres).
-        private static final double FALSE_E_M = 609601.22;
-        private static final double FALSE_N_M = 0.0;
-
-        // US Survey Foot → metre.  Note: NOT the international foot 0.3048;
-        // NC State Plane is defined in US Survey Feet (1 ft = 1200/3937 m).
-        private static final double SURVEY_FT_TO_M = 1200.0 / 3937.0;
-
-        // Pre-computed projection constants n, F, ρ0.  Snyder eq. (15-1),
-        // (15-2), (15-1a) using the t function (15-9) and m function (14-15).
-        private static final double N;
-        private static final double F;
-        private static final double RHO_0;
-
-        static {
-            double m1 = m(PHI_1);
-            double m2 = m(PHI_2);
-            double t1 = t(PHI_1);
-            double t2 = t(PHI_2);
-            double t0 = t(PHI_0);
-            N = (Math.log(m1) - Math.log(m2)) / (Math.log(t1) - Math.log(t2));
-            F = m1 / (N * Math.pow(t1, N));
-            RHO_0 = A * F * Math.pow(t0, N);
-        }
-
-        /** Snyder eq. (14-15): m = cos φ / sqrt(1 − e² sin² φ). */
-        private static double m(double phi) {
-            double s = Math.sin(phi);
-            return Math.cos(phi) / Math.sqrt(1.0 - E2 * s * s);
-        }
-
-        /** Snyder eq. (15-9): t = tan(π/4 − φ/2) / [(1 − e sin φ)/(1 + e sin φ)]^(e/2). */
-        private static double t(double phi) {
-            double s = Math.sin(phi);
-            double a = Math.tan(Math.PI/4.0 - phi/2.0);
-            double b = (1.0 - E*s) / (1.0 + E*s);
-            return a / Math.pow(b, E/2.0);
-        }
-
-        /**
-         * Inverse projection: (easting, northing) in US Survey Feet →
-         * (longitude, latitude) in WGS84 decimal degrees.  Returns
-         * {@code double[]{lon, lat}}.
-         *
-         * @throws ArithmeticException for inputs that fail to converge
-         *         (very rare — happens only for points hundreds of km
-         *         outside the projection's reasonable area of use).
-         */
-        public double[] toWgs84(double xFeet, double yFeet) {
-            // Survey feet → metres, then subtract false origin.
-            double x = xFeet * SURVEY_FT_TO_M - FALSE_E_M;
-            double y = yFeet * SURVEY_FT_TO_M - FALSE_N_M;
-
-            // Snyder eq. (15-10): ρ = sign(n) × √(x² + (ρ0 − y)²)
-            double dy = RHO_0 - y;
-            double rho = Math.copySign(Math.sqrt(x*x + dy*dy), N);
-
-            // Snyder eq. (15-11): θ = atan2(x, ρ0 − y).
-            double theta = Math.atan2(x, dy);
-
-            // Snyder eq. (15-8): t = (ρ / (a × F))^(1/n).
-            double tVal = Math.pow(rho / (A * F), 1.0 / N);
-
-            // Solve for φ iteratively from t (Snyder eq. 7-9 / 15-4).
-            // Initial estimate: φ = π/2 − 2 arctan t.  Then refine.
-            double phi = Math.PI/2.0 - 2.0 * Math.atan(tVal);
-            for (int i = 0; i < 25; i++) {
-                double s = Math.sin(phi);
-                double next = Math.PI/2.0 - 2.0 * Math.atan(
-                        tVal * Math.pow((1.0 - E*s) / (1.0 + E*s), E/2.0));
-                if (Math.abs(next - phi) < 1.0e-12) {
-                    phi = next; break;
-                }
-                phi = next;
-            }
-
-            // λ = θ/n + λ0.
-            double lam = theta / N + LAM_0;
-
-            return new double[]{ Math.toDegrees(lam), Math.toDegrees(phi) };
-        }
     }
 
     /** Public result holder for endpoints and callers. */
