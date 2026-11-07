@@ -109,23 +109,27 @@ public class CimEnrichmentService {
         long start = System.currentTimeMillis();
         log.info("CimEnrichment starting: job={} org={}", jobId, orgId);
 
-        Map<String, String>       bvMap    = buildBvMap(jobId);
-        Map<String, List<String>> tByEquip = buildTerminalsByEquip(jobId);
-        Map<String, String>       cnByT    = buildCnByTerminal(jobId);
-        Map<String, String>       vlByCn   = buildVlByCn(jobId);
-        Map<String, SubInfo>      subByVl  = buildSubByVl(jobId);
+        Map<String, String>       bvMap     = buildBvMap(jobId);
+        log.info("HEAP after bvMap: {}MB", Runtime.getRuntime().totalMemory()/1024/1024);
+        // equipToCn replaces tByEquip + cnByT — single Terminal pass, equip → list of CN rdfIds
+        Map<String, List<String>> equipToCn = buildEquipToCn(jobId);
+        log.info("HEAP after equipToCn: {}MB", Runtime.getRuntime().totalMemory()/1024/1024);
+        Map<String, String>       vlByCn    = buildVlByCn(jobId);
+        log.info("HEAP after vlByCn: {}MB", Runtime.getRuntime().totalMemory()/1024/1024);
+        Map<String, SubInfo>      subByVl   = buildSubByVl(jobId);
+        log.info("HEAP after subByVl: {}MB", Runtime.getRuntime().totalMemory()/1024/1024);
         enrichWithRegions(jobId, subByVl);
         // GeneratingUnit → SynchronousMachine rdfId
         // (GeneratingUnit has no direct Terminal — must go via SynchronousMachine)
-        Map<String, String>       smByGu   = buildSmByGu(jobId);
-        Map<String, String>       vlBvMap  = buildVlBvMap(jobId);
-        // friendlyNameMap: IdentifiedObject rdfId → friendly display name
-        // Built from cim:Name objects (Name.IdentifiedObject → Name.name)
-        Map<String, String>       friendlyNameMap = buildFriendlyNameMap(jobId);
+        Map<String, String>       smByGu    = buildSmByGu(jobId);
+        log.info("HEAP after smByGu: {}MB", Runtime.getRuntime().totalMemory()/1024/1024);
+        Map<String, String>       vlBvMap   = buildVlBvMap(jobId);
+        log.info("HEAP after vlBvMap: {}MB", Runtime.getRuntime().totalMemory()/1024/1024);
+        // friendlyNameMap skipped — too many Name objects for 256MB heap
+        Map<String, String>       friendlyNameMap = new HashMap<>();
 
-        log.info("Maps: bv={} tByEquip={} cnByT={} vlByCn={} subByVl={} friendlyNames={}",
-                bvMap.size(), tByEquip.size(), cnByT.size(), vlByCn.size(),
-                subByVl.size(), friendlyNameMap.size());
+        log.info("Maps: bv={} equipToCn={} vlByCn={} subByVl={}",
+                bvMap.size(), equipToCn.size(), vlByCn.size(), subByVl.size());
 
         long voltageCount = 0, substationCount = 0;
         long enrichedObjectCount = 0;   // unique objects that received ≥1 enriched attribute
@@ -139,8 +143,8 @@ public class CimEnrichmentService {
             List<Map<String, Object>> updates = new ArrayList<>(page.size());
             for (Document doc : page) {
                 Map<String, String> enriched = new LinkedHashMap<>();
-                computeVoltage(doc, bvMap, smByGu, tByEquip, cnByT, vlByCn, vlBvMap, enriched);
-                computeSubstations(doc, tByEquip, cnByT, vlByCn, subByVl, smByGu, friendlyNameMap, enriched);
+                computeVoltage(doc, bvMap, smByGu, equipToCn, vlByCn, vlBvMap, enriched);
+                computeSubstations(doc, equipToCn, vlByCn, subByVl, smByGu, friendlyNameMap, enriched);
                 computeFriendlyName(doc, friendlyNameMap, enriched);
                 if (enriched.isEmpty()) continue;
                 if (enriched.containsKey("nominalVoltage")) voltageCount++;
@@ -195,48 +199,32 @@ public class CimEnrichmentService {
         return map;
     }
 
-    /** equipmentRdfId → list of Terminal rdfIds. */
-    private Map<String, List<String>> buildTerminalsByEquip(String jobId) {
+    /**
+     * Single Terminal pass: equipmentRdfId → list of ConnectivityNode rdfIds.
+     * Replaces the two-map approach (tByEquip + cnByT) — eliminates the
+     * intermediate Terminal rdfId strings from heap entirely.
+     * Memory saving: ~100MB for 450K+ Terminal objects in CAISO.
+     */
+    private Map<String, List<String>> buildEquipToCn(String jobId) {
         Map<String, List<String>> map = new HashMap<>();
         String lastId = null;
         while (true) {
-            // Only need rdfId + the one ref key pointing to equipment
+            // Project both ref keys in one pass — no need to store Terminal rdfId
             List<Document> batch = findDocs(jobId, "Terminal", lastId,
-                    "_id", "rdfId", "resolvedRefIds." + REF_T_EQUIP);
+                    "_id", "resolvedRefIds." + REF_T_EQUIP, "resolvedRefIds." + REF_T_CN);
             if (batch.isEmpty()) break;
             lastId = batch.get(batch.size()-1).getObjectId("_id").toHexString();
             for (Document doc : batch) {
-                String rdfId = doc.getString("rdfId");
                 Document refs = doc.get("resolvedRefIds", Document.class);
-                if (rdfId == null || refs == null) continue;
+                if (refs == null) continue;
                 String equipId = (String) refs.get(REF_T_EQUIP);
-                if (equipId != null && !equipId.isBlank())
-                    map.computeIfAbsent(equipId, k -> new ArrayList<>()).add(rdfId);
+                String cnId    = (String) refs.get(REF_T_CN);
+                if (equipId != null && !equipId.isBlank()
+                        && cnId != null && !cnId.isBlank())
+                    map.computeIfAbsent(equipId, k -> new ArrayList<>()).add(cnId);
             }
         }
-        log.info("buildTerminalsByEquip: {} entries", map.size());
-        return map;
-    }
-
-    /** Terminal.rdfId → ConnectivityNode.rdfId. */
-    private Map<String, String> buildCnByTerminal(String jobId) {
-        Map<String, String> map = new HashMap<>();
-        String lastId = null;
-        while (true) {
-            // Only need rdfId + the one ref key pointing to CN
-            List<Document> batch = findDocs(jobId, "Terminal", lastId,
-                    "_id", "rdfId", "resolvedRefIds." + REF_T_CN);
-            if (batch.isEmpty()) break;
-            lastId = batch.get(batch.size()-1).getObjectId("_id").toHexString();
-            for (Document doc : batch) {
-                String rdfId = doc.getString("rdfId");
-                Document refs = doc.get("resolvedRefIds", Document.class);
-                if (rdfId == null || refs == null) continue;
-                String cnId = (String) refs.get(REF_T_CN);
-                if (cnId != null && !cnId.isBlank()) map.put(rdfId, cnId);
-            }
-        }
-        log.info("buildCnByTerminal: {} entries", map.size());
+        log.info("buildEquipToCn: {} entries", map.size());
         return map;
     }
 
@@ -606,8 +594,7 @@ public class CimEnrichmentService {
     private void computeVoltage(Document doc,
                                  Map<String, String> bvMap,
                                  Map<String, String> smByGu,
-                                 Map<String, List<String>> tByEquip,
-                                 Map<String, String> cnByT,
+                                 Map<String, List<String>> equipToCn,
                                  Map<String, String> vlByCn,
                                  Map<String, String> vlBvMap,
                                  Map<String, String> enriched) {
@@ -624,24 +611,23 @@ public class CimEnrichmentService {
         }
 
         // Path 2: GeneratingUnit has no direct BaseVoltage ref.
-        // Chain: GU → SM (via smByGu) → Terminal → CN → VL → BaseVoltage
+        // Chain: GU → SM (via smByGu) → CN (via equipToCn) → VL → BaseVoltage
         String rdfId = doc.getString("rdfId");
         if (rdfId == null) return;
         String smRdfId = smByGu.get(rdfId);
         if (smRdfId == null) return;
 
-        List<String> terminals = tByEquip.get(smRdfId);
-        if (terminals == null || terminals.isEmpty()) return;
+        List<String> cnIds = equipToCn.get(smRdfId);
+        if (cnIds == null || cnIds.isEmpty()) return;
 
-        for (String tId : terminals) {
-            String cnId = cnByT.get(tId);   if (cnId == null) continue;
+        for (String cnId : cnIds) {
             String vlId = vlByCn.get(cnId); if (vlId == null) continue;
             String bvRdfId = vlBvMap.get(vlId);
             if (bvRdfId == null) continue;
             String voltage = bvMap.get(bvRdfId);
             if (voltage != null && !voltage.isBlank()) {
                 enriched.put("nominalVoltage", voltage);
-                return; // first terminal's voltage is sufficient
+                return;
             }
         }
     }
@@ -651,8 +637,7 @@ public class CimEnrichmentService {
             new HashSet<>(Arrays.asList("ACLineSegment", "PowerTransformer"));
 
     private void computeSubstations(Document doc,
-                                     Map<String, List<String>> tByEquip,
-                                     Map<String, String> cnByT,
+                                     Map<String, List<String>> equipToCn,
                                      Map<String, String> vlByCn,
                                      Map<String, SubInfo> subByVl,
                                      Map<String, String> smByGu,
@@ -665,20 +650,19 @@ public class CimEnrichmentService {
         String rdfId = doc.getString("rdfId");
         if (rdfId == null) return;
 
-        // Try direct Terminal lookup first
-        List<String> terminals = tByEquip.get(rdfId);
+        // Try direct equip→CN lookup first
+        List<String> cnIds = equipToCn.get(rdfId);
 
         // GeneratingUnit has no direct Terminal — look up via SynchronousMachine
-        if ((terminals == null || terminals.isEmpty()) && smByGu.containsKey(rdfId)) {
+        if ((cnIds == null || cnIds.isEmpty()) && smByGu.containsKey(rdfId)) {
             String smRdfId = smByGu.get(rdfId);
-            terminals = tByEquip.get(smRdfId);
+            cnIds = equipToCn.get(smRdfId);
         }
 
-        if (terminals == null || terminals.isEmpty()) return;
+        if (cnIds == null || cnIds.isEmpty()) return;
 
         LinkedHashMap<String, SubInfo> found = new LinkedHashMap<>();
-        for (String tId : terminals) {
-            String cnId = cnByT.get(tId);    if (cnId == null) continue;
+        for (String cnId : cnIds) {
             String vlId = vlByCn.get(cnId);  if (vlId == null) continue;
             SubInfo sub = subByVl.get(vlId); if (sub == null) continue;
             String key = sub.mrid != null ? sub.mrid : sub.rdfId;
