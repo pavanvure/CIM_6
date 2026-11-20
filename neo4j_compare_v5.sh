@@ -200,73 +200,61 @@ function status(a, b) { if (a == "") return "ONLY_IN_" T; if (b == "") return "O
 
 COMMENT_AWK='
 # ---- node comment rules ----
-function comment_node(labels, src, tgt, st,    c) {
-    c = ""
-    if (labels ~ /TIE_LINE/) {
-        if (st ~ /^ONLY_IN_/)  return "TIE_LINE label is a DEV-platform feature; not present in legacy INT POC"
-        if (st == "MISMATCH")  return "TIE_LINE label grouping splits node counts vs INT where all are plain ACLineSegment"
-        return ""
-    }
-    if (st == "ONLY_IN_" S) return "Label set exists only in " S " — may be a new type added in DEV platform"
-    if (st == "ONLY_IN_" T) return "Label set exists only in " T " — may be a legacy-only type not imported in DEV"
+function comment_node(labels, src, tgt, st,    d) {
+    if (st == "ONLY_IN_" S) return "Node group exists only in " S " — verify import type filter config"
+    if (st == "ONLY_IN_" T) return "Node group exists only in " T " — verify import type filter config"
     if (st == "MISMATCH") {
         d = src - tgt; if (d < 0) d = -d
-        if (d <= 5) return "Count differs by " d " — verify if any source records were filtered or skipped during import"
-        return "Count mismatch — check import filter config or source data differences between environments"
+        if (d <= 5) return "Count differs by " d " — small gap; check if any nodes were skipped during import"
+        return "Count mismatch (" S "=" src ", " T "=" tgt ") — check import filter or source data differences"
     }
     return ""
 }
 
 # ---- relationship comment rules ----
-function comment_rel(rel, src, tgt, st,    c) {
-    if (rel ~ /TIE_LINE/) {
-        if (st ~ /^ONLY_IN_/) return "TIE_LINE label on endpoint only in DEV platform; relationship group absent in INT"
-        if (st == "MISMATCH") return "TIE_LINE endpoint splits this relationship into a separate row vs INT aggregated count"
-        return ""
-    }
+function comment_rel(rel, src, tgt, st,    d) {
     # caiso_ (underscore) or caiso. (dot) vendor namespace in relationship key
     if (rel ~ /caiso[_.]/ || rel ~ /spc[_.]/ || rel ~ /rdfs[_.]/) {
         if (st == "MISMATCH" || st ~ /^ONLY_IN_/)
-            return "Non-CIM namespace separator changed from colon (caiso:) to underscore (caiso_) in DEV; INT uses legacy colon format"
+            return "Vendor namespace key: DEV uses underscore separator (caiso_x); INT uses colon (caiso:x) — expected difference"
         return ""
     }
-    if (st == "ONLY_IN_" S) return "Relationship type exists only in " S " — may be new relationship added in DEV platform"
-    if (st == "ONLY_IN_" T) return "Relationship type exists only in " T " — may be legacy-only relationship not modelled in DEV"
+    if (st == "ONLY_IN_" S) return "Relationship exists only in " S " — verify import or model differences"
+    if (st == "ONLY_IN_" T) return "Relationship exists only in " T " — verify import or model differences"
     if (st == "MISMATCH") {
         d = src - tgt; if (d < 0) d = -d
-        if (d <= 5) return "Count differs by " d " — verify specific nodes missing a relationship endpoint"
+        if (d <= 5) return "Count differs by " d " — check for nodes missing a relationship endpoint in " S
         return "Count mismatch — check if related nodes were filtered or type-excluded during import"
     }
     return ""
 }
 
 # ---- property comment rules ----
-function comment_prop(entity, labels, prop, dtype, src, tgt, st,    c, side, d) {
+function comment_prop(entity, labels, prop, dtype, src, tgt, st,    side, d) {
     # 1. Vendor-namespace property: underscore form (caiso_x) OR dot form (caiso.Class.attr)
     if (prop ~ /^caiso[_.]/ || prop ~ /^spc[_.]/ || prop ~ /^rdfs[_.]/) {
         if (st == "MISMATCH")
-            return "Vendor property (caiso/spc/rdfs): DEV stores key as caiso_x, INT stored it as caiso:x — count difference is expected due to key rename"
+            return "Vendor property: DEV stores as caiso_x (underscore), INT stored as caiso:x (colon) — key rename causes count difference"
         if (st ~ /^ONLY_IN_/) {
             side = (st == "ONLY_IN_" S) ? S : T
-            return "Vendor property exists only in " side " — namespace separator changed from colon to underscore between INT and DEV"
+            return "Vendor property only in " side " — namespace separator changed from colon (INT) to underscore (DEV); other side used different key name"
         }
         return ""
     }
-    # 2. Property present on only one side — often empty-value difference
-    if (st ~ /^ONLY_IN_/) {
-        side = (st == "ONLY_IN_" S) ? S : T
-        if (labels ~ /TIE_LINE/)
-            return "Property only in " side " — TIE_LINE nodes are DEV-only (INT has no TIE_LINE label); counts will differ for this node group"
-        return "Property only in " side " — DEV cim_objects skips blank/empty values; INT POC may have stored empty strings for this property"
-    }
-    # 3. Count mismatch
+    # 2. Property only in INT — INT stored empty strings, DEV import skips blank values
+    if (st == "ONLY_IN_" T)
+        return "Property exists only in INT — INT (native POC) stored empty/blank values for this property; DEV import skips blank values"
+    # 3. Property only in DEV
+    if (st == "ONLY_IN_" S)
+        return "Property exists only in DEV — may be a newly enriched or computed property not present in INT native POC"
+    # 4. Count mismatch
     if (st == "MISMATCH") {
         d = src - tgt; if (d < 0) d = -d
-        if (labels ~ /TIE_LINE/)
-            return "Count differs because TIE_LINE is a DEV-only label; INT counts all these nodes under plain ACLineSegment"
+        if (tgt > src)
+            return "INT count (" tgt ") > DEV count (" src ") — INT native POC stored empty/blank values that DEV import skips; difference = " d
         if (src == 0 || tgt == 0)
-            return "One side has 0 — DEV cim_objects skips blank/empty values; INT POC may have stored them"
-        return "Count differs by " d " — check for blank values or type-filter differences between INT and DEV"
+            return "One side has 0 occurrences — INT native POC may have stored blank values; DEV import does not store empty strings"
+        return "Count differs by " d " — INT may have blank values counted; DEV skips empty strings during import"
     }
     return ""
 }'
