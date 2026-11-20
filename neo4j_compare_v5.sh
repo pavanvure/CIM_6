@@ -241,31 +241,32 @@ function comment_rel(rel, src, tgt, st,    c) {
 }
 
 # ---- property comment rules ----
-function comment_prop(entity, labels, prop, dtype, src, tgt, st,    c) {
-    # 1. TIE_LINE node group — check first so it overrides everything for non-MATCH rows
-    if (labels ~ /TIE_LINE/) {
-        if (st != "MATCH") return "TIE_LINE label is DEV-only; property count reflects DEV subset only — not a data error"
-        return ""
-    }
-    # 2. Vendor-namespace property: underscore form (caiso_x) OR dot form (caiso.Class.attr)
+function comment_prop(entity, labels, prop, dtype, src, tgt, st,    c, side, d) {
+    # 1. Vendor-namespace property: underscore form (caiso_x) OR dot form (caiso.Class.attr)
     if (prop ~ /^caiso[_.]/ || prop ~ /^spc[_.]/ || prop ~ /^rdfs[_.]/) {
         if (st == "MISMATCH")
-            return "Vendor-namespace property: key uses underscore separator in DEV (caiso_x), colon in INT (caiso:x); count difference expected"
-        if (st ~ /^ONLY_IN_/)
-            return "Vendor-namespace property exists only in one environment due to namespace separator change (caiso: → caiso_)"
+            return "Vendor property (caiso/spc/rdfs): DEV stores key as caiso_x, INT stored it as caiso:x — count difference is expected due to key rename"
+        if (st ~ /^ONLY_IN_/) {
+            side = (st == "ONLY_IN_" S) ? S : T
+            return "Vendor property exists only in " side " — namespace separator changed from colon to underscore between INT and DEV"
+        }
         return ""
     }
-    # 3. Property present on only one side — often empty-value difference
+    # 2. Property present on only one side — often empty-value difference
     if (st ~ /^ONLY_IN_/) {
         side = (st == "ONLY_IN_" S) ? S : T
-        return "Property present only in " side " — DEV cim_objects skips blank values; INT POC may have stored empty strings"
+        if (labels ~ /TIE_LINE/)
+            return "Property only in " side " — TIE_LINE nodes are DEV-only (INT has no TIE_LINE label); counts will differ for this node group"
+        return "Property only in " side " — DEV cim_objects skips blank/empty values; INT POC may have stored empty strings for this property"
     }
-    # 4. Count mismatch — one side is 0 → classic blank-value difference
+    # 3. Count mismatch
     if (st == "MISMATCH") {
         d = src - tgt; if (d < 0) d = -d
+        if (labels ~ /TIE_LINE/)
+            return "Count differs because TIE_LINE is a DEV-only label; INT counts all these nodes under plain ACLineSegment"
         if (src == 0 || tgt == 0)
-            return "One side has 0 occurrences — DEV cim_objects skips blank/empty values; INT POC may have stored them"
-        return "Property count differs — check if blank values or type-filter differences exist between environments"
+            return "One side has 0 — DEV cim_objects skips blank/empty values; INT POC may have stored them"
+        return "Count differs by " d " — check for blank values or type-filter differences between INT and DEV"
     }
     return ""
 }'
